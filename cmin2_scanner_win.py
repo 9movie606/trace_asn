@@ -67,6 +67,9 @@ def scamper_ping(ip_list, max_delay=50, pps=2000):
 
     try:
         print(f"Starting scamper ping for {len(ip_list)} IPs (Speed: {pps} pps)...")
+        # =====================================================================
+        # ⚠️ 這裡的 "-p", str(pps) 控制了 Ping 的併發發包速率
+        # =====================================================================
         cmd = [SCAMPER_CMD, "-c", "ping -c 1", "-p", str(pps), "-O", "json", "-f", temp_ip_file]
         
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
@@ -111,6 +114,10 @@ def scamper_trace_and_filter(ip_list):
 
     try:
         print(f"Starting traceroute and filtering for {len(ip_list)} IPs...")
+    # =====================================================================
+    # ⚠️ 【修改位置 1】 # Trace 階段同樣預設限制 500 pps 避免頻寬塞爆
+    # （家用寬頻建議 1000-2000，大頻寬伺服器可調至 5000-10000）
+    # =====================================================================
         cmd = [SCAMPER_CMD, "-c", "trace", "-p", "500", "-O", "json", "-f", temp_ip_file]
         
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
@@ -148,9 +155,15 @@ if __name__ == "__main__":
     raw_inputs = """
     172.64.144.0/20
     """
-    
+    # =====================================================================
+    # ⚠️ 【修改位置 2】改延遲閾值：把下面的 50 改成你想要的毫秒數（例如 30 或 70）
+    # =====================================================================
     max_ping_delay = 50  # 延遲閾值 (ms)
-    ping_pps = 2000      # Ping 併發速度 (pps)
+    # =====================================================================
+    # ⚠️ 【修改位置 3】改 Ping 併發數：把下面的 2000 改成你每秒想發送的封包數
+    # （家用寬頻建議 1000-2000，大頻寬伺服器可調至 5000-10000）
+    # =====================================================================
+    ping_pps = 500      # Ping 併發速度 (pps)
     
     ips = get_shuffled_ips(raw_inputs)
     print(f"Total shuffled IPs: {len(ips)}")

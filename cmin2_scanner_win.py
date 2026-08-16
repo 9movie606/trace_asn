@@ -1,3 +1,9 @@
+#⚠️ 
+##需要 安裝 scamper 
+##需要 安裝 Python 套件
+
+
+
 import ipaddress
 import random
 import subprocess

@@ -1,0 +1,1299 @@
+import { connect } from "cloudflare:sockets";
+
+// ============================================================
+// EdgeTunnel → Snippets 精簡移植版
+// VLESS + XHTTP stream-one + ProxyIP
+//
+// 保留：
+//   VLESS
+//   XHTTP stream-one
+//   cloudflare:sockets
+//   ProxyIP: IP:port / domain / [IPv6]:port
+//   ProxyIP domain 的 TXT → A → AAAA 解析
+//
+// 移除：
+//   Trojan / Shadowsocks / SOCKS5 / HTTP / HTTPS / TURN / SSTP
+//   WebSocket / gRPC / UDP / Admin / 前端 / KV
+//
+// ProxyIP 使用規則：
+//   CF CDN target → ProxyIP
+//   非 CF target → Direct
+//
+// 第一版 CF target 判定：
+//   1. target === 當前請求 hostname
+//   2. 或 target 在 CF_HOSTS 中
+// ============================================================
+
+
+// ========================= 基礎配置 =========================
+
+// VLESS UUID
+const UUID = "6be07fca-7e5f-4535-a084-26e7d0742c5a";
+
+// 沒有 ?proxyip= 時使用的預設 ProxyIP
+// 可填：
+//   1.2.3.4:443
+//   proxy.example.com
+//   [2001:db8::1]:443
+const DEFAULT_PROXYIP = "proxyip.example.com";
+
+// 可選。
+// 如果除了「目前請求 hostname」之外，還有其他 CF CDN hostname，
+// 可以寫在這裡。
+// 例如：
+// const CF_HOSTS = ["cdn.example.com", "worker.example.com"];
+const CF_HOSTS = [];
+
+// TCP 連接 timeout
+const CONNECT_TIMEOUT = 5000;
+
+// 首包最大等待大小
+const HANDSHAKE_MAX = 16384;
+
+// 上行小包合併目標，沿用 EdgeTunnel 思路
+const UPSTREAM_PACK_SIZE = 20 * 1024;
+
+
+// ========================= 基礎工具 =========================
+
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+function toUint8Array(data) {
+  if (data instanceof Uint8Array) return data;
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  if (ArrayBuffer.isView(data)) {
+    return new Uint8Array(
+      data.buffer,
+      data.byteOffset,
+      data.byteLength
+    );
+  }
+  return new Uint8Array(data);
+}
+
+function closeQuietly(socket) {
+  try {
+    socket?.close?.();
+  } catch {}
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+
+// ========================= UUID =========================
+
+function uuidToBytes(uuid) {
+  const clean = String(uuid || "").replace(/-/g, "");
+
+  if (clean.length !== 32) {
+    throw new Error("Invalid UUID");
+  }
+
+  const out = new Uint8Array(16);
+
+  for (let i = 0; i < 16; i++) {
+    const n = Number.parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+
+    if (!Number.isFinite(n)) {
+      throw new Error("Invalid UUID");
+    }
+
+    out[i] = n;
+  }
+
+  return out;
+}
+
+const UUID_BYTES = uuidToBytes(UUID);
+
+function matchUUID(data, offset = 1) {
+  if (data.byteLength < offset + 16) return false;
+
+  for (let i = 0; i < 16; i++) {
+    if (data[offset + i] !== UUID_BYTES[i]) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+
+// ========================= XHTTP Padding =========================
+//
+// EdgeTunnel:
+//   header = UUID.slice(1, 7)
+//   key    = "_" + UUID.slice(25, 31)
+//
+// 這部分保留。
+// ================================================================
+
+function getXHTTPPaddingIdentity() {
+  return {
+    header: UUID.slice(1, 7),
+    key: "_" + UUID.slice(25, 31)
+  };
+}
+
+function randomBase62(length) {
+  const chars =
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+  let result = "";
+
+  for (let i = 0; i < length; i++) {
+    result += chars[
+      Math.floor(Math.random() * chars.length)
+    ];
+  }
+
+  return result;
+}
+
+function buildXHTTPResponseHeaders() {
+  const headers = new Headers({
+    "Content-Type": "application/octet-stream",
+    "X-Accel-Buffering": "no",
+    "Cache-Control": "no-store, no-cache, no-transform",
+    "X-Content-Type-Options": "nosniff"
+  });
+
+  const { header, key } = getXHTTPPaddingIdentity();
+
+  try {
+    const paddingURL = new URL("https://x.invalid/");
+    paddingURL.searchParams.set(
+      key,
+      randomBase62(100 + Math.floor(Math.random() * 901))
+    );
+
+    headers.set(header, paddingURL.toString());
+  } catch {}
+
+  return headers;
+}
+
+
+// ========================= VLESS 首包 =========================
+//
+// 基本完全按照 EdgeTunnel 的 VLESS parser 思路。
+// ================================================================
+
+function parseVLESSHeader(data) {
+  const length = data.byteLength;
+
+  if (length < 18) {
+    return { status: "need_more" };
+  }
+
+  if (!matchUUID(data, 1)) {
+    return { status: "invalid" };
+  }
+
+  const optLen = data[17];
+  const cmdIndex = 18 + optLen;
+
+  if (length < cmdIndex + 1) {
+    return { status: "need_more" };
+  }
+
+  const command = data[cmdIndex];
+
+  // TCP only
+  if (command !== 1) {
+    return {
+      status: "invalid",
+      error: "Only VLESS TCP is supported"
+    };
+  }
+
+  const portIndex = cmdIndex + 1;
+
+  if (length < portIndex + 3) {
+    return { status: "need_more" };
+  }
+
+  const port =
+    (data[portIndex] << 8) |
+    data[portIndex + 1];
+
+  const addressType = data[portIndex + 2];
+  const addressIndex = portIndex + 3;
+
+  let hostname = "";
+  let headerLength = 0;
+
+  // IPv4
+  if (addressType === 1) {
+    if (length < addressIndex + 4) {
+      return { status: "need_more" };
+    }
+
+    hostname = [
+      data[addressIndex],
+      data[addressIndex + 1],
+      data[addressIndex + 2],
+      data[addressIndex + 3]
+    ].join(".");
+
+    headerLength = addressIndex + 4;
+  }
+
+  // Domain
+  else if (addressType === 2) {
+    if (length < addressIndex + 1) {
+      return { status: "need_more" };
+    }
+
+    const domainLength = data[addressIndex];
+
+    if (length < addressIndex + 1 + domainLength) {
+      return { status: "need_more" };
+    }
+
+    hostname = decoder.decode(
+      data.subarray(
+        addressIndex + 1,
+        addressIndex + 1 + domainLength
+      )
+    );
+
+    headerLength =
+      addressIndex + 1 + domainLength;
+  }
+
+  // IPv6
+  else if (addressType === 3) {
+    if (length < addressIndex + 16) {
+      return { status: "need_more" };
+    }
+
+    const parts = [];
+
+    for (let i = 0; i < 8; i++) {
+      const p = addressIndex + i * 2;
+
+      parts.push(
+        ((data[p] << 8) | data[p + 1]).toString(16)
+      );
+    }
+
+    hostname = parts.join(":");
+
+    headerLength = addressIndex + 16;
+  }
+
+  else {
+    return {
+      status: "invalid",
+      error: `Invalid address type: ${addressType}`
+    };
+  }
+
+  if (!hostname) {
+    return {
+      status: "invalid",
+      error: "Empty target hostname"
+    };
+  }
+
+  return {
+    status: "ok",
+
+    hostname,
+    port,
+
+    // VLESS response header
+    respHeader: new Uint8Array([
+      data[0],
+      0
+    ]),
+
+    // 第一個 TCP payload
+    rawData: data.subarray(headerLength)
+  };
+}
+
+
+// ========================= 讀取 VLESS 首包 =========================
+//
+// EdgeTunnel 的重要做法：
+// 不假設一次 request.body.read() 就得到完整 VLESS header。
+// ================================================================
+
+async function readVLESSFirstPacket(reader) {
+  let buffer = new Uint8Array(1024);
+  let offset = 0;
+
+  while (offset < HANDSHAKE_MAX) {
+    const { value, done } = await reader.read();
+
+    if (done) {
+      if (offset === 0) return null;
+      break;
+    }
+
+    const chunk = toUint8Array(value);
+
+    if (!chunk.byteLength) continue;
+
+    if (offset + chunk.byteLength > buffer.byteLength) {
+      const newSize = Math.min(
+        HANDSHAKE_MAX,
+        Math.max(
+          buffer.byteLength * 2,
+          offset + chunk.byteLength
+        )
+      );
+
+      const next = new Uint8Array(newSize);
+
+      next.set(
+        buffer.subarray(0, offset)
+      );
+
+      buffer = next;
+    }
+
+    const copyLength = Math.min(
+      chunk.byteLength,
+      buffer.byteLength - offset
+    );
+
+    buffer.set(
+      chunk.subarray(0, copyLength),
+      offset
+    );
+
+    offset += copyLength;
+
+    const parsed = parseVLESSHeader(
+      buffer.subarray(0, offset)
+    );
+
+    if (parsed.status === "ok") {
+      return {
+        ...parsed,
+        reader
+      };
+    }
+
+    if (parsed.status === "invalid") {
+      return null;
+    }
+
+    if (offset >= HANDSHAKE_MAX) {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+
+// ========================= ProxyIP parser =========================
+
+function parseHostPort(value) {
+  let input = String(value || "").trim();
+
+  if (!input) {
+    throw new Error("Empty ProxyIP");
+  }
+
+  // 去掉簡單 scheme，第一版不接受真正的 HTTP/SOCKS scheme。
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(input)) {
+    throw new Error("ProxyIP must be IP:port or domain");
+  }
+
+  // [IPv6]:port
+  if (input.startsWith("[")) {
+    const end = input.indexOf("]");
+
+    if (end < 0) {
+      throw new Error("Invalid IPv6 ProxyIP");
+    }
+
+    const hostname = input.slice(1, end);
+
+    let port = 443;
+
+    if (input[end + 1] === ":") {
+      port = Number(
+        input.slice(end + 2)
+      );
+    }
+
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error("Invalid ProxyIP port");
+    }
+
+    return {
+      hostname,
+      port
+    };
+  }
+
+  // IPv4/domain:port
+  const colonCount =
+    (input.match(/:/g) || []).length;
+
+  if (colonCount === 1) {
+    const index = input.lastIndexOf(":");
+
+    const hostname =
+      input.slice(0, index);
+
+    const port =
+      Number(input.slice(index + 1));
+
+    if (
+      hostname &&
+      Number.isInteger(port) &&
+      port >= 1 &&
+      port <= 65535
+    ) {
+      return {
+        hostname,
+        port
+      };
+    }
+  }
+
+  // 純 domain / IPv4
+  // 原版 ProxyIP domain 預設 443
+  if (colonCount === 0) {
+    return {
+      hostname: input,
+      port: 443
+    };
+  }
+
+  // 未加 [] 的 IPv6
+  return {
+    hostname: input,
+    port: 443
+  };
+}
+
+
+// ========================= DNS TXT / A / AAAA =========================
+//
+// ProxyIP=domain 時，沿用 EdgeTunnel 思路：
+// TXT → A → AAAA → 原 domain
+// ================================================================
+
+const dnsCache = new Map();
+
+async function dohQuery(name, type) {
+  const key = `${type}:${name.toLowerCase()}`;
+  const now = Date.now();
+
+  const cached = dnsCache.get(key);
+
+  if (cached && now - cached.time < 180000) {
+    return cached.data;
+  }
+
+  const response = await fetch(
+    `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=${type}`,
+    {
+      headers: {
+        "Accept": "application/dns-json"
+      }
+    }
+  );
+
+  if (!response.ok) {
+    return [];
+  }
+
+  const json = await response.json();
+  const answer = Array.isArray(json.Answer)
+    ? json.Answer
+    : [];
+
+  dnsCache.set(key, {
+    time: now,
+    data: answer
+  });
+
+  return answer;
+}
+
+function parseTXTValues(answer) {
+  const result = [];
+
+  for (const item of answer) {
+    if (item.type !== 16 || typeof item.data !== "string") {
+      continue;
+    }
+
+    let text = item.data;
+
+    if (
+      text.startsWith('"') &&
+      text.endsWith('"')
+    ) {
+      text = text.slice(1, -1);
+    }
+
+    text = text
+      .replace(/\\010/g, ",")
+      .replace(/\n/g, ",");
+
+    for (const part of text.split(",")) {
+      const value = part.trim();
+
+      if (value) {
+        result.push(value);
+      }
+    }
+  }
+
+  return result;
+}
+
+async function resolveProxyIP(value) {
+  const base = parseHostPort(value);
+
+  // IP / IPv6：直接使用
+  if (
+    /^[0-9.]+$/.test(base.hostname) ||
+    base.hostname.includes(":")
+  ) {
+    return [base];
+  }
+
+  let txt = [];
+
+  try {
+    txt = parseTXTValues(
+      await dohQuery(base.hostname, "TXT")
+    );
+  } catch {}
+
+  if (txt.length) {
+    const result = [];
+
+    for (const item of txt) {
+      try {
+        result.push(parseHostPort(item));
+      } catch {}
+    }
+
+    if (result.length) {
+      return result;
+    }
+  }
+
+  // A
+  try {
+    const a = await dohQuery(
+      base.hostname,
+      "A"
+    );
+
+    const result = a
+      .filter(x => x.type === 1)
+      .map(x => ({
+        hostname: x.data,
+        port: base.port
+      }));
+
+    if (result.length) {
+      return result;
+    }
+  } catch {}
+
+  // AAAA
+  try {
+    const aaaa = await dohQuery(
+      base.hostname,
+      "AAAA"
+    );
+
+    const result = aaaa
+      .filter(x => x.type === 28)
+      .map(x => ({
+        hostname: x.data,
+        port: base.port
+      }));
+
+    if (result.length) {
+      return result;
+    }
+  } catch {}
+
+  // 最後保留 domain 本身
+  return [base];
+}
+
+
+// ========================= CF CDN target 判斷 =========================
+//
+// 第一版故意不做「DNS 判斷是不是 Cloudflare IP」。
+// 原因：
+//   1. 多一次 DNS/subrequest
+//   2. 可能誤判
+//   3. 你的典型場景是 VLESS target = CDN hostname
+//
+// 所以：
+//   target === request.hostname → ProxyIP
+//   target ∈ CF_HOSTS          → ProxyIP
+//   其他                       → Direct
+// ================================================================
+
+function isCFTarget(targetHost, requestHost) {
+  const target =
+    String(targetHost || "").toLowerCase().replace(/\.$/, "");
+
+  const current =
+    String(requestHost || "").toLowerCase().replace(/\.$/, "");
+
+  if (target === current) {
+    return true;
+  }
+
+  return CF_HOSTS.some(
+    host =>
+      String(host || "")
+        .toLowerCase()
+        .replace(/\.$/, "") === target
+  );
+}
+
+
+// ========================= TCP connect =========================
+
+async function connectTCP(hostname, port) {
+  const socket = connect(
+    {
+      hostname,
+      port
+    },
+    {
+      allowHalfOpen: true
+    }
+  );
+
+  await Promise.race([
+    socket.opened,
+
+    new Promise((_, reject) =>
+      setTimeout(
+        () => reject(new Error("TCP connect timeout")),
+        CONNECT_TIMEOUT
+      )
+    )
+  ]);
+
+  return socket;
+}
+
+
+// ========================= 首包寫入 =========================
+
+async function writeFirstPacket(socket, data) {
+  if (!data?.byteLength) return;
+
+  const writer =
+    socket.writable.getWriter();
+
+  try {
+    await writer.write(
+      toUint8Array(data)
+    );
+  } finally {
+    try {
+      writer.releaseLock();
+    } catch {}
+  }
+}
+
+
+// ========================= Direct / ProxyIP =========================
+
+async function connectDirect(
+  targetHost,
+  targetPort,
+  firstData
+) {
+  const socket =
+    await connectTCP(
+      targetHost,
+      targetPort
+    );
+
+  try {
+    await writeFirstPacket(
+      socket,
+      firstData
+    );
+
+    return socket;
+  } catch (error) {
+    closeQuietly(socket);
+    throw error;
+  }
+}
+
+async function connectViaProxyIP(
+  proxyValue,
+  firstData
+) {
+  const candidates =
+    await resolveProxyIP(proxyValue);
+
+  let lastError = null;
+
+  for (const candidate of candidates) {
+    let socket = null;
+
+    try {
+      socket = await connectTCP(
+        candidate.hostname,
+        candidate.port
+      );
+
+      await writeFirstPacket(
+        socket,
+        firstData
+      );
+
+      return socket;
+    } catch (error) {
+      lastError = error;
+      closeQuietly(socket);
+    }
+  }
+
+  throw (
+    lastError ||
+    new Error("ProxyIP connection failed")
+  );
+}
+
+
+// ========================= 上行 Grain 合包 =========================
+//
+// 這裡保留 EdgeTunnel 的核心思路，
+// 但刪掉它針對重撥、queue overflow 的大量 WS 邏輯。
+//
+// 小 chunk → 約 20KB 合併
+// 大 chunk → 直接送
+// 約 1ms flush
+// ================================================================
+
+function createUploadGrainStream(targetSize = UPSTREAM_PACK_SIZE) {
+  const stream =
+    typeof IdentityTransformStream !== "undefined"
+      ? new IdentityTransformStream()
+      : new TransformStream();
+
+  const writer =
+    stream.writable.getWriter();
+
+  const buffer =
+    new Uint8Array(targetSize);
+
+  let bufferLength = 0;
+  let timer = null;
+  let writeChain = Promise.resolve();
+
+  const clearTimer = () => {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+
+  const serialWrite = async chunk => {
+    writeChain =
+      writeChain.then(() =>
+        writer.write(chunk)
+      );
+
+    await writeChain;
+  };
+
+  const flush = async () => {
+    if (!bufferLength) return;
+
+    const chunk =
+      buffer.slice(0, bufferLength);
+
+    bufferLength = 0;
+
+    await serialWrite(chunk);
+  };
+
+  const scheduleFlush = () => {
+    if (timer !== null) return;
+
+    timer = setTimeout(() => {
+      timer = null;
+      void flush().catch(() => {});
+    }, 1);
+  };
+
+  return {
+    readable: stream.readable,
+
+    async write(chunk) {
+      const data = toUint8Array(chunk);
+
+      if (!data.byteLength) {
+        return;
+      }
+
+      if (data.byteLength >= targetSize) {
+        clearTimer();
+
+        if (bufferLength) {
+          await flush();
+        }
+
+        await serialWrite(data);
+        return;
+      }
+
+      if (
+        bufferLength + data.byteLength >=
+        targetSize
+      ) {
+        const combined =
+          new Uint8Array(
+            bufferLength + data.byteLength
+          );
+
+        combined.set(
+          buffer.subarray(0, bufferLength),
+          0
+        );
+
+        combined.set(
+          data,
+          bufferLength
+        );
+
+        bufferLength = 0;
+        clearTimer();
+
+        await serialWrite(combined);
+        return;
+      }
+
+      buffer.set(
+        data,
+        bufferLength
+      );
+
+      bufferLength +=
+        data.byteLength;
+
+      scheduleFlush();
+    },
+
+    async end() {
+      clearTimer();
+
+      await writeChain;
+      await flush();
+
+      try {
+        await writer.close();
+      } finally {
+        try {
+          writer.releaseLock();
+        } catch {}
+      }
+    }
+  };
+}
+
+
+// ========================= XHTTP 主處理 =========================
+
+async function handleXHTTP(
+  request,
+  requestURL
+) {
+  if (request.method !== "POST") {
+    return new Response(null, {
+      status: 204
+    });
+  }
+
+  if (!request.body) {
+    return new Response("Bad Request", {
+      status: 400
+    });
+  }
+
+  const contentType =
+    (
+      request.headers.get("content-type") ||
+      ""
+    )
+      .split(";", 1)[0]
+      .trim()
+      .toLowerCase();
+
+  // XHTTP 以 octet-stream 為主要測試入口。
+  // 同時接受 application/grpc，
+  // 但這裡不是實作 gRPC protocol。
+  if (
+    contentType !== "application/octet-stream" &&
+    !contentType.startsWith("application/grpc")
+  ) {
+    return new Response(null, {
+      status: 204
+    });
+  }
+
+  // ----------------------------------------------------------
+  // 1. 讀 VLESS 首包
+  // ----------------------------------------------------------
+
+  const initialReader =
+    request.body.getReader();
+
+  let first;
+
+  try {
+    first =
+      await readVLESSFirstPacket(
+        initialReader
+      );
+  } catch (error) {
+    try {
+      initialReader.releaseLock();
+    } catch {}
+
+    return new Response(
+      "Invalid request",
+      { status: 400 }
+    );
+  }
+
+  if (!first) {
+    try {
+      initialReader.releaseLock();
+    } catch {}
+
+    return new Response(
+      "Invalid request",
+      { status: 400 }
+    );
+  }
+
+  // ----------------------------------------------------------
+  // 2. VLESS TCP only
+  // ----------------------------------------------------------
+
+  if (!first.hostname || !first.port) {
+    try {
+      initialReader.releaseLock();
+    } catch {}
+
+    return new Response(
+      "Invalid VLESS target",
+      { status: 400 }
+    );
+  }
+
+  // ----------------------------------------------------------
+  // 3. 首包 reader 不再使用
+  //    rawData 已經包含第一個 TCP payload。
+  // ----------------------------------------------------------
+
+  try {
+    initialReader.releaseLock();
+  } catch {}
+
+  // ----------------------------------------------------------
+  // 4. 判斷 Direct / ProxyIP
+  // ----------------------------------------------------------
+
+  const requestHost =
+    requestURL.hostname;
+
+  const useProxy =
+    isCFTarget(
+      first.hostname,
+      requestHost
+    );
+
+  // ----------------------------------------------------------
+  // 5. 建立 upstream TCP
+  // ----------------------------------------------------------
+
+  let socket = null;
+
+  try {
+    if (useProxy) {
+      const proxyValue =
+        requestURL.searchParams.get(
+          "proxyip"
+        ) || DEFAULT_PROXYIP;
+
+      if (!proxyValue) {
+        throw new Error(
+          "CF target requires proxyip"
+        );
+      }
+
+      socket =
+        await connectViaProxyIP(
+          proxyValue,
+          first.rawData
+        );
+    } else {
+      // 非 CF target：
+      // 永遠 direct。
+      socket =
+        await connectDirect(
+          first.hostname,
+          first.port,
+          first.rawData
+        );
+    }
+  } catch (error) {
+    closeQuietly(socket);
+
+    return new Response(
+      "bad gateway",
+      {
+        status: 502
+      }
+    );
+  }
+
+  if (!socket) {
+    return new Response(
+      "bad gateway",
+      {
+        status: 502
+      }
+    );
+  }
+
+  // ----------------------------------------------------------
+  // 6. Abort / lifecycle
+  // ----------------------------------------------------------
+
+  const abortController =
+    new AbortController();
+
+  let closed = false;
+
+  const cleanup = reason => {
+    if (closed) return;
+
+    closed = true;
+
+    try {
+      abortController.abort(reason);
+    } catch {}
+
+    closeQuietly(socket);
+  };
+
+  // ----------------------------------------------------------
+  // 7. Client → socket
+  //
+  // 保留 EdgeTunnel 的：
+  //
+  // request.body
+  //      ↓
+  // Grain
+  //      ↓
+  // socket.writable
+  // ----------------------------------------------------------
+
+  const uploadTask =
+    (async () => {
+      const grain =
+        createUploadGrainStream();
+
+      const pipeTask =
+        grain.readable.pipeTo(
+          socket.writable,
+          {
+            signal:
+              abortController.signal
+          }
+        );
+
+      pipeTask.catch(
+        cleanup
+      );
+
+      const reader =
+        request.body.getReader();
+
+      const cancelReader = () => {
+        try {
+          reader
+            .cancel(
+              abortController.signal.reason
+            )
+            .catch(() => {});
+        } catch {}
+      };
+
+      abortController.signal.addEventListener(
+        "abort",
+        cancelReader,
+        { once: true }
+      );
+
+      try {
+        while (!closed) {
+          const {
+            value,
+            done
+          } = await reader.read();
+
+          if (done) {
+            break;
+          }
+
+          if (
+            value &&
+            value.byteLength
+          ) {
+            await grain.write(value);
+          }
+        }
+      } finally {
+        abortController.signal.removeEventListener(
+          "abort",
+          cancelReader
+        );
+
+        try {
+          reader.releaseLock();
+        } catch {}
+
+        try {
+          await grain.end();
+        } catch {}
+      }
+
+      await pipeTask;
+    })();
+
+  // ----------------------------------------------------------
+  // 8. socket → Client
+  //
+  // EdgeTunnel 原本：
+  //
+  // respHeader
+  //      ↓
+  // Response TransformStream
+  //      ↓
+  // socket.readable.pipeTo()
+  // ----------------------------------------------------------
+
+  const responseStream =
+    typeof IdentityTransformStream !== "undefined"
+      ? new IdentityTransformStream()
+      : new TransformStream();
+
+  const downloadTask =
+    (async () => {
+      const writer =
+        responseStream.writable.getWriter();
+
+      try {
+        if (
+          first.respHeader &&
+          first.respHeader.byteLength
+        ) {
+          await writer.write(
+            first.respHeader
+          );
+        }
+      } catch (error) {
+        try {
+          await writer.abort(error);
+        } catch {}
+
+        throw error;
+      } finally {
+        try {
+          writer.releaseLock();
+        } catch {}
+      }
+
+      await socket.readable.pipeTo(
+        responseStream.writable,
+        {
+          signal:
+            abortController.signal
+        }
+      );
+    })();
+
+  uploadTask.catch(cleanup);
+
+  downloadTask.then(
+    () => cleanup(),
+    cleanup
+  );
+
+  // 避免未處理 rejection
+  void Promise.allSettled([
+    uploadTask,
+    downloadTask
+  ]);
+
+  // ----------------------------------------------------------
+  // 9. Response
+  // ----------------------------------------------------------
+
+  return new Response(
+    responseStream.readable,
+    {
+      status: 200,
+      headers:
+        buildXHTTPResponseHeaders()
+    }
+  );
+}
+
+
+// ========================= Snippet Entry =========================
+
+export default {
+  async fetch(request) {
+    try {
+      const url =
+        new URL(request.url);
+
+      // 只處理 POST。
+      if (request.method !== "POST") {
+        return new Response(null, {
+          status: 204
+        });
+      }
+
+      return await handleXHTTP(
+        request,
+        url
+      );
+
+    } catch (error) {
+      return new Response(
+        "Internal error",
+        {
+          status: 500
+        }
+      );
+    }
+  }
+};

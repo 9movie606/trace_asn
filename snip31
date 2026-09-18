@@ -19,7 +19,7 @@ import { connect } from "cloudflare:sockets";
 // ========================= 基礎配置 =========================
 
 // VLESS UUID
-const UUID = "6be07fca-7e5f-4535-a084-26e7d0742c5a";
+const UUID = "";
 
 // TCP 連接 timeout
 const CONNECT_TIMEOUT = 5000;
